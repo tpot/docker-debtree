@@ -1,0 +1,14 @@
+btrfs-tools
+bash-completion
+libapparmor-dev
+libdevmapper-dev
+libsystemd-dev
+zfs-fuse
+libsqlite0-dev
+libsqlite3-dev
+
+golang-etcd-server-dev
+golang-github-opencontainers-runc-dev
+golang-github-docker-distribution-dev
+golang-github-docker-notary-dev
+golang-github-docker-libkv-dev

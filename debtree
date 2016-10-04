@@ -1,0 +1,1220 @@
+#! /usr/bin/perl -w
+
+# debtree version 1.0.2
+# Copyright 2007-2009 Frans Pop <elendil@planet.nl>
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License, or (at your option)
+# any later version.
+
+# Usage: debtree [options] <package name>
+
+# The script produces a dot file for processing with 'dot'.
+# Examples: debtree <package> > <package>.dot
+#           debtree <package> | dot -Tpng -o <package>.png
+#           debtree <package> | dot -Tps | kghostview -
+
+sub usage {
+  warn join(" ", @_)."\n" if @_;
+  warn <<EOF;
+Usage: $0 [options] package
+
+For details, see man page.
+EOF
+  exit(1);
+}
+
+use strict;
+use Cwd;
+use Getopt::Long;
+
+### INITIALIZATION ###
+
+my $HOME;
+($HOME = $ENV{'HOME'}) or die "HOME not defined in environment!\n";
+
+my @ARCHES = qw/alpha amd64 arm armel hppa i386 ia64 mips mipsel powerpc s390 sparc/;
+push(@ARCHES, qw/hurd-i386 kfreebsd-i386 kfreebsd-amd64 m68k ppc64 sh all/);
+
+my $ptype;
+my $verbose = 0;
+my $quiet = 0;
+my $show_installed = 0;
+my $show_rdeps = 0;
+my $build_dep = 0;
+my $with_alternatives = 1;
+my $with_suggests = 0;
+my $with_recommends = 1;
+my $with_conflicts = 1;
+my $with_vconflicts = 0;
+my $with_provides = 1;
+my $max_providers = 3;
+my $with_versions = 1;
+my $max_depth = 999999;
+my $rdeps_depth = 0;
+my $max_rdeps=5;
+my $no_skip = 0;
+my $skiplist_file = "";
+my $endlist_file = "";
+my $show_all = 0;
+my $do_rotate = 0;
+my $do_condense = 0;
+my $ARCH="";
+my $download_size=0;
+my $total_size=0;
+
+# Hash containing skip and end packages read from config files
+my %clist;
+# Hash containing global package status info; used types are:
+# skipped, ended, done, leaf, unknown, OR_seen, rdep, prov_rdeps
+my %pstatus;
+
+my (%OR_dep_list, %OR_virt_list, %pdep_set_list);
+my $OR_dep_cnt = 0;
+my $OR_virt_cnt = 0;
+my $pdep_set_cnt = 0;
+
+$Getopt::Long::ignorecase = 0;
+GetOptions(
+	'show-installed|I'		=> \$show_installed,
+	'show-rdeps|R'			=> \$show_rdeps,
+	'build-dep|b'			=> \$build_dep,
+	'alternatives!'			=> \$with_alternatives,
+	'recommends!'			=> \$with_recommends,
+	'conflicts!'			=> \$with_conflicts,
+	'provides!'			=> \$with_provides,
+	'max-providers=i'		=> \$max_providers,
+	'with-suggests|S'		=> \$with_suggests,
+	'versioned-conflicts|VC'	=> \$with_vconflicts,
+	'versions!'			=> \$with_versions,
+	'max-depth=i'			=> \$max_depth,
+	'rdeps-depth=i'			=> \$rdeps_depth,
+	'max-rdeps=i'			=> \$max_rdeps,
+	'skip!'				=> \$no_skip,
+        'skiplist-file=s'               => \$skiplist_file,
+        'endlist-file=s'                => \$endlist_file,
+	'show-all'			=> \$show_all,
+	'rotate|r'			=> \$do_rotate,
+	'condense'			=> \$do_condense,
+	'arch=s'			=> \$ARCH,
+	'quiet|q'			=> \$quiet,
+	'verbose|v+'			=> \$verbose,
+) or usage;
+#usage if $help;
+
+# Package for which to generate the graph
+my $requested_package = shift or error("invalid number of arguments");
+
+if (@ARGV) {
+	#error("invalid number of arguments");
+	print(STDERR "Listing of dependency paths is no longer supported.\n");
+	print(STDERR "Use 'aptitude why' instead.\n");
+	exit 1;
+}
+
+# Raise verbosity level by one unless the quiet option was passed
+$verbose++ unless $quiet;
+
+# Don't allow Suggests without Recommends
+$with_suggests = 0 unless $with_recommends;
+# Don't allow versioned Conflicts without Conflicts
+$with_vconflicts = 0 unless $with_conflicts;
+
+# Build-dep implies no-suggests and no-alternatives (unless installed packages
+# are being displayed); recommends are optional; rdeps are not allowed
+if ($build_dep) {
+	$ptype = "S";
+	$with_suggests = 0;
+	$show_rdeps = 0;
+	$with_alternatives = 0 unless $show_installed;
+	$with_provides = 0;
+} else {
+	$ptype = "B";
+}
+error("invalid value for option 'arch'") if ($ARCH && ! grep (/^$ARCH$/, @ARCHES));
+
+# These options are overlapping
+$rdeps_depth = 1 if ($show_rdeps && $rdeps_depth == 0);
+$show_rdeps = 1 if ($rdeps_depth);
+
+error("invalid value for option 'max-providers'") if ($max_providers < 1);
+error("invalid value for option 'max-depth'") if ($max_depth < 0);
+error("invalid value for option 'rdeps-depth'") if ($show_rdeps && $rdeps_depth < 1);
+error("invalid value for option 'max-rdeps'") if ($max_rdeps < 1);
+
+# The dependency types to display in the graph
+my @dtypes = qw/PreDepends Depends/;
+push(@dtypes, "Recommends") if $with_recommends;
+push(@dtypes, "Suggests") if $with_suggests;
+push(@dtypes, "Conflicts") if $with_conflicts;
+# Same for reverse dependencies
+my @rdtypes = qw/PreDepends Depends/;
+push(@rdtypes, "Recommends") if $with_recommends;
+
+# ToDo: use configurable colors for everything?
+my $rdep_color;
+if ($show_installed) {
+	$rdep_color = "azure";
+} else {
+	$rdep_color = "ivory";
+}
+
+## Initialize AptPkg's interface
+
+use AptPkg::Config '$_config';
+use AptPkg::System '$_system';
+use AptPkg::Source;
+use AptPkg::Cache;
+$_config->init();
+$_system = $_config->system();
+
+if ($verbose) {
+	# Redirect AptPkg's little ditty so it doesn't go into our files
+	open(OLDOUT, ">&STDOUT");
+	open(STDOUT, ">&STDERR");
+	select(STDERR); $| = 1;
+} else {
+	$_config->{quiet} = 2;
+}
+
+# Create instances to search for Depends and, if needed, Build-Depends
+my $cache = AptPkg::Cache->new();
+my $source;
+# AptPkg does not expose architecture conditions, but it does take them
+# into account when determining which dependencies to return. So we can
+# use AptPkg to show build dependencies for a specific architecture, but
+# not when ARCH=all. For that case we call out to apt-cache instead.
+# AptPkg defaults to the host system's architecture.
+if ($build_dep && $ARCH ne "all") {
+	$_config->{"APT::Architecture"} = $ARCH if $ARCH;
+	$source = AptPkg::Source->new();
+}
+
+if ($verbose) {
+	# Restore the redirects
+	close(STDOUT);
+	open(STDOUT, ">&OLDOUT");
+	close(OLDOUT);
+	select(STDOUT); $| = 0;
+}
+
+### LOG FUNCTIONS ###
+
+sub mylog {
+	my ($loglevel, $msg) = @_;
+	if ($loglevel <= $verbose) {
+		print(STDERR "$msg\n");
+	}
+}
+sub info {
+	my ($loglevel, $msg) = @_;
+	mylog($loglevel, "I: $msg");
+}
+sub mywarn {
+	my ($loglevel, $msg) = @_;
+	mylog($loglevel, "W: $msg");
+}
+sub debug {
+	my ($loglevel, $msg) = @_;
+	mylog($loglevel, "D: $msg");
+}
+sub error {
+	my $msg = shift;
+	mylog(0, "Error: $msg");
+	exit 1
+}
+
+### FUNCTIONS ###
+
+# Translates AptPkg's (localized) dependency types to what's used by debtree.
+# This is only needed for regular dependencies, not build dependencies.
+sub get_type {
+	my $apt_dtype = shift;
+	return "PreDepends" if ($apt_dtype == AptPkg::Dep::PreDepends);
+	return "Depends" if ($apt_dtype == AptPkg::Dep::Depends);
+	return "Recommends" if ($apt_dtype == AptPkg::Dep::Recommends);
+	return "Suggests" if ($apt_dtype == AptPkg::Dep::Suggests);
+	return "Conflicts" if ($apt_dtype == AptPkg::Dep::Conflicts);
+	return "Unsupported";
+}
+
+sub import_list {
+	my ($file, $ltype) = @_;
+
+	if (open LIST, "<$file") {
+		while (<LIST>) {
+			chomp;
+			my ($line) = /^\s*([^#]+)/;
+			$line =~ s/\s+$// if $line;
+			next unless $line;
+			for my $package (split(/ +/, $line)) {
+				$clist{$package}{$ltype} = 1;
+			}
+		}
+	}
+	close LIST;
+}
+
+sub get_bdeps_all {
+	my $package = shift;
+
+	my $pinfo = `apt-cache showsrc $package | grep -E "^Build-Depends(-Indep)?:"`;
+	chomp $pinfo;
+	$pinfo =~ s/, /,/g;
+	$pinfo =~ s/ \| /|/g;
+	return $pinfo;
+}
+
+sub get_apt_pinfo {
+	my ($package, $ptype) = @_;
+
+	if ($ptype eq "S") {
+		my $pdata = $source->get($package);
+		return unless $pdata;
+		# First in array is highest version
+		return shift(@$pdata);
+	} else {
+		my $pdata = $cache->get($package);
+		return unless $pdata;
+		if ($show_installed && exists $$pdata{CurrentVer}) {
+			return $$pdata{CurrentVer};
+		} elsif (exists $$pdata{VersionList}) {
+			# First in array is highest version
+			return shift(@{ $$pdata{VersionList} });
+		}
+	}
+}
+
+sub get_apt_deps {
+	my ($pinfo, $dtype) = @_;
+	my $delim="";
+	my $deps = "";
+
+	return "" unless $pinfo;
+	for my $dep (@{ $$pinfo{DependsList} }) {
+		next if (get_type(0 + $$dep{DepType}) ne $dtype);
+		if ($deps) {
+			$deps .= $delim;
+		}
+		$deps .= $$dep{TargetPkg}{Name};
+		if (exists $$dep{CompTypeDeb}) {
+			$deps .= " ($$dep{CompTypeDeb} $$dep{TargetVer})"
+		}
+		$delim = ($$dep{CompType} & AptPkg::Dep::Or) ? '|' : ',';
+	}
+	#debug(0, "$dtype --- $deps");
+	return $deps;
+}
+
+sub is_installed {
+	my $package = shift;
+
+	my $pinfo = $cache->get($package);
+	return ($pinfo && $$pinfo{CurrentState} eq "Installed");
+}
+
+sub get_provides {
+	my $pinfo = shift;
+
+	return unless exists $$pinfo{ProvidesList};
+	my @pset = map($_->{Name}, @{ $$pinfo{ProvidesList} });
+	return @pset if @pset;
+}
+
+# Check to see that the version we get matches the one that would
+# be selected for the rest of the graph.
+sub check_version {
+	my ($package, $version) = @_;
+	my $pinfo = get_apt_pinfo($package, "");
+	return ($$pinfo{VerStr} eq $version);
+}
+
+sub get_rdeps {
+	my ($package, $parent) = @_;
+	my %rdeps;
+
+	my $pinfo = $cache->get($package);
+	return unless ($pinfo && exists $$pinfo{RevDependsList});
+
+	for my $rdep (@{ $$pinfo{RevDependsList} }) {
+		my $pname = $$rdep{ParentPkg}{Name};
+		my $dtype = get_type(0 + $$rdep{DepType});
+
+		next unless grep(/^$dtype$/, @rdtypes);
+		next if ($parent && $pname eq $parent);
+		next unless check_version($pname, $$rdep{ParentVer}{VerStr});
+		next unless (! $show_installed || is_installed($pname));
+		# As long as we don't show versions for rdeps, avoid duplicates
+		# due to double dependencies; for example, gimp has:
+		#    Depends: libgimp2.0 (>= 2.4.7), libgimp2.0 (< 2.4.7-z)
+		next if grep(/^$pname$/, @{ $rdeps{$dtype} });
+
+		push(@{ $rdeps{$dtype} }, $pname);
+	}
+
+	return %rdeps;
+}
+
+sub get_providers {
+	my $package = shift;
+	my @providers;
+
+	my $pinfo = $cache->get($package);
+	return unless $pinfo && exists $$pinfo{ProvidesList};
+
+	for my $provider (@{ $$pinfo{ProvidesList} }) {
+		my $pname = $$provider{OwnerPkg}{Name};
+		next unless check_version($pname, $$provider{OwnerVer}{VerStr});
+		push(@providers, $pname);
+	}
+	return @providers;
+}
+
+sub set_name {
+	my ($plist, $set) = @_;
+	foreach my $s (sort keys %$set) {
+		return $s if ($$set{$s}{plist} eq $plist);
+	}
+}
+
+sub first_set_with_package {
+	my ($package, $set) = @_;
+	foreach my $s (sort keys %$set) {
+		if ($$set{$s}{plist} =~ /(^|,)\Q$package\E(,|$)/) {
+			return $s;
+		}
+	}
+}
+
+sub get_prior_OR_dep {
+	my $package = shift;
+	if (! exists $pstatus{$package}{OR_seen}) {
+		return first_set_with_package($package, \%OR_dep_list);
+	}
+}
+
+sub mark_installed {
+	my ($level, $package) = @_;
+	my $style = "filled";
+
+	$style = "\"setlinewidth(2),$style\"" if ($level == 1);
+	printf("\t\"$package\" [style=${style},fillcolor=honeydew];\n");
+}
+
+sub mark_rdep {
+	my $package = shift;
+	printf("\t\"$package\" [style=filled,fillcolor=$rdep_color];\n");
+}
+
+sub mark_endpackage {
+	my $package = shift;
+	if (! get_prior_OR_dep($package) && ! exists $pstatus{$package}{rdep}) {
+		printf("\t\"$package\" [shape=diamond];\n");
+		if ($show_installed && is_installed($package)) {
+			mark_installed(0, $package);
+		}
+	}
+}
+
+sub print_dot_header {
+	print("digraph \"$requested_package\" {\n");
+	print("\trankdir=LR;\n") unless $do_rotate;
+	print("\tconcentrate=true;\n") if $do_condense;
+	print("\tnode [shape=box];\n");
+}
+
+sub print_dot_footer {
+	print("}\n");
+
+	# Show which packages were skipped
+	my @plist;
+	for my $package (sort keys %pstatus) {
+		next unless exists $pstatus{$package}{skipped};
+		push(@plist, $package);
+	}
+	if (@plist) {
+		info(1, "The following dependencies have been excluded from the graph (skipped):");
+		info(1, "@plist");
+		# Also list excluded packages as comments in the output
+		print("// Excluded dependencies:\n");
+		print("// @plist\n");
+	}
+}
+
+sub print_dot_OR_header {	
+	my ($atype, $OR_name, $has_inst) = @_;
+
+	printf("\t$OR_name [\n");
+	print("\t\tshape = \"record\"\n");
+	if ($has_inst) {
+		if ($atype eq "P") {
+			print("\t\tstyle = \"rounded,filled\"\n");
+		} else {
+			print("\t\tstyle = \"filled\"\n");
+		}
+		print("\t\tfillcolor = \"honeydew\"\n");
+	} elsif ($atype eq "P") {
+		print("\t\tstyle = \"rounded\"\n");
+	}
+	print("\t\tlabel = \""); # no newline
+}
+sub print_dot_OR_footer {
+	print("\"\n\t]\n");
+}
+
+sub print_dot_OR_main {
+	my ($package, $seen, $first) = @_;
+
+	print(" | ") unless $first;
+	# Mark packages previously encountered
+	if ($package eq "...") {
+		print("<other> ...");
+	} elsif (exists $pstatus{$package}{unknown}) {
+		print("<$package> ?$package?");
+	} elsif ($seen == 2) {
+		print("<$package> \\{$package\\}");
+	} elsif ($seen == 1) {
+		print("<$package> [$package]");
+	} else {
+		print("<$package> $package");
+	}
+}
+
+sub print_alternatives {
+	my ($atype, $OR_name, $OR_has_inst, $OR_pkgs) = @_;
+
+	my $first = 1;
+	print_dot_OR_header($atype, $OR_name, $OR_has_inst);
+	for my $package (split(/,/,  $OR_pkgs)) {
+		# Is this package also part of an earlier set of alternatives?
+		my $seen = 0;
+		if (exists $pstatus{$package}{OR_seen}) {
+			$seen = 1;
+		} else {
+			my $t_or = first_set_with_package($package, \%OR_dep_list);
+			if ($atype eq "D") {
+				if (exists $clist{$package}{end} ||
+				    exists $pstatus{$package}{ended}) {
+					$seen = 2;
+				} elsif ($OR_dep_list{$t_or}{plist} ne $OR_pkgs) {
+					$seen = 1;
+				}
+			} else {
+				if ($t_or) {
+					$seen = 1;
+				} elsif (exists $pstatus{$package}{done} &&
+					 ! exists $pstatus{$package}{ended}) {
+					$seen = 1; 
+				} else {
+					# Not seen; mark as end package
+					$seen = 2;
+				}
+			}
+		}
+
+		print_dot_OR_main($package, $seen, $first);
+		$first = 0;
+	}
+	print_dot_OR_footer();
+}
+
+sub cjoin {
+	my ($str1, $sep, $str2) = @_;
+	return ($str1 ? ($str1 . $sep) : "") . $str2;
+}
+sub cjoin_quoted {
+	my ($str1, $sep, $str2) = @_;
+	return ($str1 ? ("\"$str1\"" . $sep) : "") . "\"$str2\"";
+}
+
+sub print_dot_dependency {
+	my $package = shift;
+	my $OR_name = shift;
+	my $prevdep_OR_name = shift;
+	my $dep_package = shift;
+	my $dtype = shift;
+	my $pkgdep = shift;
+	my $rdep = shift;
+	my ($opts, $verdep, $arch_cond, $p_package, $p_dep_package, $prior_OR_dep);
+
+	# Second or later dependency in alternatives: skip unless versioned (see also below)
+	# TODO: make this work better if only some of the alternatives have versioned deps
+	if ($OR_name && (! $with_versions || ! $pkgdep) &&
+	    $OR_dep_list{$OR_name}{plist} =~ /,\Q$dep_package\E(,|$)/) {
+		return
+	}
+
+	# No extra options if $dtype = Recommends
+	$opts = cjoin($opts, ",", "color=purple,style=bold") if ($dtype eq "PreDepends");
+	$opts = cjoin($opts, ",", "color=blue") if ($dtype eq "Depends");
+	$opts = cjoin($opts, ",", "style=dotted") if ($dtype eq "Suggests");
+	$opts = cjoin($opts, ",", "color=red") if ($dtype eq "Conflicts");
+	$opts = cjoin($opts, ",", "color=darkgoldenrod,style=bold") if ($dtype eq "Build-Depends");
+	$opts = cjoin($opts, ",", "color=goldenrod") if ($dtype eq "Build-Depends-Indep");
+
+	if ($pkgdep) {
+		($verdep) = $pkgdep =~ /(\(.*\))/;
+		($arch_cond) = $pkgdep =~ /(\[.*\])/;
+		# Always include versions for versioned conflicts
+		if ($verdep && ($with_versions || $dtype eq "Conflicts")) {
+			$opts = cjoin($opts, ",", "label=\"$verdep" . ($arch_cond ? "\\n$arch_cond" : "") . "\"");
+		} elsif ($arch_cond && $dtype =~ /Build-Depends/) {
+			$opts = cjoin($opts, ",", "label=\"$verdep\"");
+		}
+	}
+	$opts = $opts ? " [$opts]" : "";
+
+	$p_package = cjoin_quoted($prevdep_OR_name, ":", $package);
+
+	if ($OR_name) {
+		# Make the link to the alternatives to the group, unless we have
+		# to show version or arch condition (see also above)
+		if (($with_versions && $verdep) || $arch_cond) {
+			$p_dep_package = cjoin_quoted($OR_name, ":", $dep_package);
+		} else {
+			$p_dep_package = "\"$OR_name\"";
+		}
+	} else {
+		# Keep all dependencies on a package with the first alternative
+		# For now unless package was previously encountered separately,
+		# in which case we use square brackets in the labels (print_dot_OR_main)
+		$prior_OR_dep = get_prior_OR_dep($dep_package);
+		$p_dep_package = cjoin_quoted($prior_OR_dep, ":", $dep_package);
+	}
+
+	printf("\t$p_package -> $p_dep_package$opts;\n");
+
+	# How can "end" packages that are part of an OR be identified?
+	# For now, marked by using braces in the labels (see print_dot_OR_main)
+	if (exists $clist{$dep_package}{end} && ! $rdep &&
+	    ! $OR_name && ! $prior_OR_dep &&
+	    ! exists $pstatus{$dep_package}{done}) {
+		if ($dtype ne "Conflicts") {
+			debug(4, "Adding '$dep_package' ($dtype) to ended (list)");
+			$pstatus{$dep_package}{ended} = 1;
+		}
+		$pstatus{$dep_package}{done} = 1;
+	}
+}
+
+sub print_rdeps_provides {
+	my $rdep = shift;
+	my $dtype = shift;
+	my $package = shift;
+	my @pset = @_;
+
+	if (! exists $pstatus{$rdep}{prov_rdeps}) {
+		debug(4, "Provider rdeps: $rdep - $dtype - $package - @pset");
+	} else {
+		debug(4, "Provider rdeps: $rdep is already done");
+		return 1
+	}
+	$pstatus{$rdep}{prov_rdeps} = 1;
+
+	my $pinfo = get_apt_pinfo($rdep, "");
+	my $deps = get_apt_deps($pinfo, $dtype);
+	my $regex = "(\Q" . join("\E|\Q", @pset) . "\E)";
+	for my $dep_or (split(/,/, $deps)) {
+		next unless $dep_or =~ /(^|\|)$regex([| ]|$)/;
+
+		my @dset;
+		my $cnt = 0;
+		for my $d (split(/\|/, $dep_or)) {
+			$d =~ s/ .*//; # strip version
+			push(@dset, $d);
+			$cnt++;
+
+			# Packages not in the pset are leaf packages
+			if (! grep(/^$d$/, @pset) && ! exists $pstatus{$d}{ended}) {
+				debug(4, "Provider rdeps: adding '$d' to ended (list)");
+				$pstatus{$d}{ended} = 1;
+			}
+		}
+		return 0 if ($cnt == 1);
+
+		my $pdep_set_name = set_name(join(",", @dset), \%pdep_set_list);
+		if (! $pdep_set_name) {
+			$pdep_set_cnt++;
+			$pdep_set_name = "pds" . $pdep_set_cnt;
+			debug(3, "Provider rdeps: new set '$pdep_set_name' - @dset");
+			my $cnt = 0;
+			for my $p (@dset) {
+				printf("\t\"$pdep_set_name\" -> \"$p\" [style=dotted,label=\"(".++$cnt.")\"];\n");
+			}
+			printf("\t\"$pdep_set_name\" [shape=circle,label=or];\n");
+			$pdep_set_list{$pdep_set_name}{plist} = join(",", @dset);
+		}
+		print_dot_dependency($rdep, "", "", $pdep_set_name, $dtype, "", "");
+	}
+	return 1
+}
+
+sub process_deps {
+	my $level = shift;
+	my $package = shift;
+	my $deps = shift;
+	my $dtype = shift;
+	my $prevdep_OR_name = shift;
+
+	return if ($max_depth == 0);
+	debug(3, "$level - dependencies for '$package' ($dtype): $deps");
+
+	for my $dep (split(/,/, $deps)) {
+		my $OR_name;
+		my (@OR_pkgs, @OR_uninst);
+		my ($OR_skip, $OR_has_skip, $OR_has_inst, $OR_has_uninst, $OR_has_other);
+
+		if ($dep =~ /\|/ && ($with_alternatives || $show_installed)) {
+			# Gather information about alternatives
+			for my $dep_or (split(/\|/, $dep)) {
+				my ($dep_package) = $dep_or =~ /^([^ ]+) ?/;
+				if (exists $clist{$dep_package}{skip}) {
+					$pstatus{$dep_package}{skipped} = 1;
+					$OR_has_skip = 1;
+					# Account for installation status
+					if ($show_installed) {
+						if (is_installed($dep_package)) {
+							$OR_has_inst = 1;
+						} else {
+							$OR_has_uninst = 1;
+						}
+					}
+					next;
+				}
+
+				if (! $show_installed) {
+					push(@OR_pkgs, $dep_package);
+				} elsif (is_installed $dep_package) {
+					push(@OR_pkgs, $dep_package);
+					$OR_has_inst = 1;
+				} else {
+					push(@OR_uninst, $dep_package);
+					$OR_has_uninst = 1;
+				}
+			}
+			# If none of the alternatives is installed, show them all
+			if ($show_installed && ! $OR_has_inst) {
+				push(@OR_pkgs, @OR_uninst);
+				$OR_has_uninst = 0;
+			}
+			$OR_skip = 1 unless @OR_pkgs;
+			$OR_has_other = ($OR_has_skip || $OR_has_uninst);
+			push(@OR_pkgs, "...") if $OR_has_other;
+
+			# Create alternative dependency "records" for dot graph
+			if (! $OR_skip && $with_alternatives) {
+
+				# Check if we already have these (exact) alternatives
+				$OR_name = set_name(join(",", @OR_pkgs), \%OR_dep_list);
+				if (! $OR_name) {
+					$OR_dep_cnt++;
+					$OR_name = "alt" . $OR_dep_cnt;
+
+					debug(3, "Alternatives: new set '$OR_name' - @OR_pkgs");
+					for my $dep_package (@OR_pkgs) {
+						# Has this dependency already been
+						# processed as a separate package?
+						if (exists $pstatus{$dep_package}{done} &&
+						   ! first_set_with_package($dep_package, \%OR_dep_list) &&
+						   ! exists $pstatus{$dep_package}{OR_seen}) {
+							$pstatus{$dep_package}{OR_seen} = 1;
+						}
+					}
+
+					$OR_dep_list{$OR_name}{plist} = join(",", @OR_pkgs);
+					$OR_dep_list{$OR_name}{has_inst} = $OR_has_inst;
+				} else {
+					debug(3, "Alternatives: matches existing set '$OR_name'");
+				}
+			}
+		}
+
+		if ($OR_skip) {
+			debug(3, "Alternatives: skipping ('$dep')");
+			next;
+		}
+
+		for my $dep_or (split(/\|/, $dep)) {
+			my ($dep_package) = $dep_or =~ /^([^ ]+) ?/;
+			debug(3, "Processing dependency '$package'->'$dep_package'");
+
+			if ($show_installed && $OR_name &&
+			    ! grep(/^$dep_package$/, @OR_pkgs)) {
+				next;
+			}
+
+			# Note: for build dependencies pkgdep can include architecture conditions
+			my ($pkgdep) = $dep_or =~ m/ (.*)/;
+
+			if (exists $clist{$dep_package}{skip}) {
+				$pstatus{$dep_package}{skipped} = 1;
+				next;
+			} elsif ($dtype eq "Conflicts" && ! $with_vconflicts && $pkgdep) {
+				# Include only unversioned conflicts
+				next;
+			}
+			print_dot_dependency($package, $OR_name, $prevdep_OR_name, $dep_package, $dtype, $pkgdep);
+
+			if (exists $pstatus{$dep_package}{done} ||
+			    exists $clist{$dep_package}{end}) {
+				# do nothing
+			} else {
+				# Recurse through dependencies, except for Suggests
+				# and Conflicts
+				if ($dtype eq "Suggests") {
+					if (! exists $pstatus{$dep_package}{done}) {
+						debug(4, "Adding '$dep_package' ($dtype) to ended");
+						$pstatus{$dep_package}{ended} = 1;
+						$pstatus{$dep_package}{leaf} = 1;
+					}
+				} elsif ($dtype eq "Conflicts") {
+					if (! exists $pstatus{$dep_package}{done}) {
+						$pstatus{$dep_package}{leaf} = 1;
+					}
+				} else {
+					if ($level < $max_depth) {
+						process_package($level + 1, $dep_package, $OR_name, "");
+					} else {
+						debug(4, "Adding '$dep_package' ($dtype) to ended (max)");
+						$pstatus{$dep_package}{ended} = 1;
+					}
+				}
+			}
+
+			last unless $with_alternatives;
+		}
+	}
+}
+
+sub pre_process_deps {
+	my $level = shift;
+	my $package = shift;
+	my $prevdep_OR_name = shift;
+	my $pinfo = shift;
+
+	my $dtype = "";
+	my $delim = "";
+	my $deps = "";
+
+	return unless exists $$pinfo{DependsList};
+	for my $dep (@{ $$pinfo{DependsList} }) {
+		my $new_type = get_type(0 + $$dep{DepType});
+		if ($new_type ne $dtype) {
+			if ($deps) {
+				process_deps($level, $package, $deps, $dtype, $prevdep_OR_name);
+				$delim = "";
+				$deps = "";
+			}
+			$dtype = $new_type;
+		}
+		next unless grep(/^$dtype$/, @dtypes);
+		if ($deps) {
+			$deps .= $delim;
+		}
+		$deps .= $$dep{TargetPkg}{Name};
+		if (exists $$dep{CompTypeDeb}) {
+			$deps .= " ($$dep{CompTypeDeb} $$dep{TargetVer})"
+		}
+		$delim = ($$dep{CompType} & AptPkg::Dep::Or) ? '|' : ',';
+	}
+	# Ensure the dependency type encountered last also gets processed
+	if ($deps) {
+		process_deps($level, $package, $deps, $dtype, $prevdep_OR_name);
+	}
+}
+
+sub pre_process_bdeps {
+	my ($level, $package, $pinfo) = @_;
+
+	if ($ARCH eq "all") {
+		# $pinfo contains output from apt-cache (see get_bdeps_all)
+		for my $dtype (qw/Build-Depends Build-Depends-Indep/) {
+			my ($deps) = $pinfo =~ /^$dtype: (.*)/;
+			next unless $deps;
+			process_deps($level, $package, $deps, $dtype, "");
+		}
+	} else {
+		# $pinfo is a pointer to AptPkg data
+		return unless exists $$pinfo{BuildDepends};
+		for my $dtype (keys %{ $$pinfo{BuildDepends} }) {
+			my $deps = "";
+			for my $dep (@{ $$pinfo{BuildDepends}{$dtype} }) {
+				if ($deps) {
+					$deps .= ",";
+				}
+				$deps .= @$dep[0];
+				if (@$dep[1]) {
+					$deps .= " (@$dep[1] @$dep[2])"
+				}
+			}
+			process_deps($level, $package, $deps, $dtype, "");
+		}
+	}
+}
+
+sub process_virtual {
+	my $level = shift;
+	my $package = shift;
+	my $prevdep_OR_name = shift;
+	my $ptype = shift;
+	my @providers = @_; # must be last
+	my $prior_OR_dep;
+	my (@OR_pkgs, @OR_uninst);
+	my ($OR_name, $OR_has_inst, $OR_has_uninst);
+
+	if (exists $pstatus{$package}{done}) {
+		debug(3, "$level - virtual package '$package' already done");
+		return;
+	} elsif ($level == 1) {
+		debug(3, "$level - '@providers' provides '$package'");
+	} else {
+		debug(3, "$level - '$package' provided by: @providers");
+	}
+
+	my $p_package = cjoin_quoted($prevdep_OR_name, ":", $package);
+
+	my $prov_cnt = @providers;
+	if ($prov_cnt == 1) {
+		my $provider = pop(@providers);
+		if ($ptype eq "V" && exists $pstatus{$provider}{done}) {
+			debug(3, "$level - '$package' has no other providers");
+			return;
+		} elsif ($level != 1 && exists $clist{$provider}{skip}) {
+			$pstatus{$provider}{skipped} = 1;
+		} else {
+			$prior_OR_dep = get_prior_OR_dep($provider);
+			my $p_provider = cjoin_quoted($prior_OR_dep, ":", $provider);
+			if ($level == 1 && ! $show_rdeps) {
+				printf("\t$p_provider -> $p_package [arrowhead=inv,color=green];\n");
+			} else {
+				printf("\t$p_package -> $p_provider [dir=back,arrowtail=inv,color=green];\n");
+			}
+
+			if (exists $clist{$provider}{end} && ! $prior_OR_dep &&
+			   ! exists $pstatus{$provider}{done}) {
+				debug(4, "Adding '$provider' (provides) to ended (list)");
+				$pstatus{$provider}{ended} = 1;
+				$pstatus{$provider}{done} = 1;
+			}
+
+			# Process as leaf to show other providers
+			if ($level == 1 && ! exists $pstatus{$package}{done}) {
+				process_package(0, $package, "", "V");
+			}
+
+			# Recurse to get dependencies for providing package
+			$pstatus{$package}{done} = 1;
+			if (! exists $pstatus{$provider}{done} && $ptype ne "L") {
+				process_package($level + 1, $provider, "", "");
+			}
+		}
+	} else {
+		# Note: if there are multiple providing packages, we do
+		# not recurse into them!
+		for my $provider (@providers) {
+			if ($show_installed) {
+				if (is_installed($provider)) {
+					push(@OR_pkgs, $provider);
+					$OR_has_inst = 1;
+				} else {
+					push(@OR_uninst, $provider);
+					$OR_has_uninst = 1;
+				}
+			} else {
+				push(@OR_pkgs, $provider);
+			}
+		}
+		if ($show_installed && ! @OR_pkgs) {
+			# If none of the alternatives is installed, show them all
+			push(@OR_pkgs, @OR_uninst);
+			$OR_has_uninst = 0;
+		}
+		push(@OR_pkgs, "...") if $OR_has_uninst;
+
+		# Only show multiple providing packages if there are $max_providers
+		# or less, or when restricted to installed packages
+		if ($prov_cnt < $max_providers || ($show_installed && $OR_has_inst)) {
+			# Check if we already have these (exact) alternative providers
+			$OR_name = set_name(join(",", @OR_pkgs), \%OR_virt_list);
+			if (! $OR_name) {
+				$OR_virt_cnt++;
+				$OR_name = "virt" . $OR_virt_cnt;
+
+				debug(3, "Providers: new set '$OR_name' - @OR_pkgs");
+				$OR_virt_list{$OR_name}{plist} = join(",", @OR_pkgs);
+				$OR_virt_list{$OR_name}{has_inst} = $OR_has_inst;
+			} else {
+				debug(3, "Providers: matches existing set '$OR_name'");
+			}
+
+			# Print the arrow now; the record itself is printed later
+			printf("\t$p_package -> $OR_name [dir=back,arrowtail=inv,color=green];\n");
+		} else {
+			printf("\t$p_package -> \"Pr_$package\" [label=\"-$prov_cnt-\",dir=back,arrowtail=inv,color=green];\n");
+			printf("\t\"Pr_$package\" [label=\"...\",style=rounded];\n");
+		}
+	}
+
+	# Green arrow sufficiently identifies virtual package that is part of alternatives
+	if (! $prevdep_OR_name || exists $pstatus{$package}{OR_seen}) {
+		printf("\t\"$package\" [shape=octagon];\n") unless ($ptype eq "V");
+	}
+	$pstatus{$package}{done} = 1;
+}
+
+sub process_missing {
+	my $package = shift;
+
+	my $prior_OR_dep = get_prior_OR_dep($package);
+	if (! $prior_OR_dep) {
+		printf("\t\"$package\" [style=filled,fillcolor=oldlace];\n");
+	} else {
+		$pstatus{$package}{unknown} = 1;
+	}
+}
+
+sub find_rdeps {
+	my $level = shift;
+	my $package = shift;
+	my $parent = shift;
+	my @provides = @_;
+	my $has_max = 0;
+
+	info(2, "Level $level: processing reverse dependencies for $package");
+	$pstatus{$package}{rdep} = 1;
+
+	my @recurse_rdeps;
+	my %rdeps = get_rdeps($package, $parent);
+	for my $dtype (sort keys %rdeps) {
+		my @rdeps = @{ $rdeps{$dtype} };
+		my $cnt = @rdeps;
+		if ($cnt > 0) {
+			debug(4, "$level - " . ($show_installed ? "installed " : "") . "$dtype rdeps for '$package' ($cnt): @rdeps");
+		}
+
+		my $opts;
+		if ($level < -1 && $cnt > $max_rdeps) {
+			$opts = "color=purple,style=bold" if ($dtype eq "PreDepends");
+			$opts = "color=blue" if ($dtype eq "Depends");
+			$opts = "" if ($dtype eq "Recommends");
+			$opts = " [label=\"-$cnt-\",$opts]"; # FIXME if dtype=Recommends ?
+			printf("\t\"RD_$package\" -> \"$package\" $opts;\n");
+			$has_max = 1;
+			next;
+		}
+
+		push(@recurse_rdeps, @rdeps);
+		for my $rdep (@rdeps) {
+			if (@provides && 
+			   print_rdeps_provides($rdep, $dtype, $package, ($parent, @provides))) {
+				next;
+			}
+
+			if (! exists $pstatus{$rdep}{done}) {
+				debug(4, "$level - adding reverse dependency '$rdep'->'$package'");
+				print_dot_dependency($rdep, "", "", $package, $dtype, "", 1);
+			} else {
+				debug(4, "$level - package '$rdep' is already done");
+			}
+		}
+	}
+
+	for my $rdep (@recurse_rdeps) {
+		if (! exists $pstatus{$rdep}{rdep}) {
+			if (! exists $pstatus{$rdep}{done}) {
+				mark_rdep($rdep);
+			}
+			next unless ($level > -$rdeps_depth);
+			if ($level == -1) {
+				find_rdeps($level - 1, $rdep, $package);
+			} else {
+				find_rdeps($level - 1, $rdep, "");
+			}
+		}
+	}
+
+	if ($has_max) {
+		printf("\t\"RD_$package\" [label=\"...\",style=\"rounded,filled\",fillcolor=$rdep_color];\n");
+	}
+}
+
+sub process_package {
+	my $level = shift;
+	my $package = shift;
+	my $prevdep_OR_name = shift;
+	my $ptype = shift;
+	my $pinfo;
+	my $pdata = $cache->get($package);
+	my $size=0;
+
+	info(2, "Level $level: processing $package" . ($ptype ? " ($ptype)" : ""));
+
+	# something installed?
+	if (exists $$pdata{CurrentVer}) {
+		$size=$pdata->{CurrentVer}->{InstalledSize};
+		$total_size += $size;
+		$size=$pdata->{CurrentVer}->{Size};
+		$download_size += $size;
+		info (2,"size of $package: $size / total size: $total_size / download size: $download_size");
+	}else {
+		# is there a list of versions available in cache?
+		if (exists $$pdata{VersionList}) {
+			# just use first version
+			my $first_version=shift(@{ $$pdata{VersionList} });
+			$size=$first_version->{InstalledSize};
+			$total_size += $size;
+			$size=$first_version->{Size};
+			$download_size += $size;
+			info (2,"size of first $package: $size / total size: $total_size / download site: $download_size");
+               } else {
+			info (2,"no size available: $package");
+               }
+	}
+
+	if ($ptype ne "L" && exists $pstatus{$package}{ended}) {
+		debug(4, "Removing '$package' from ended");
+		delete $pstatus{$package}{ended};
+	}
+
+	if ($ptype eq "S" && $ARCH eq "all") {
+		# AptPkg does not expose architecture conditions, so use apt-cache
+		$pinfo = get_bdeps_all($package);
+	} else {
+		$pinfo = get_apt_pinfo($package, $ptype);
+		info(3, "Using package version: " .
+			(($ptype eq "S") ? $$pinfo{Version} : $$pinfo{VerStr}))
+			if $pinfo;
+	}
+	if ($ptype eq "S" || $ptype eq "B") {
+		if ($pinfo) { 
+			print_dot_header();
+		} else {
+			error("no dependency info found for '$package'");
+		}
+	}
+	if (! $pinfo) {
+		my @providers = get_providers($package);
+		if (@providers) {
+			# For leaf packages we need to check if it was an alternative
+			$prevdep_OR_name = get_prior_OR_dep($package) if ($ptype eq "L");
+
+			process_virtual($level, $package, $prevdep_OR_name, $ptype, @providers);
+		} else {
+			process_missing($package);
+		}
+	}
+
+	# Mark as done now to prevent recursion loops
+	$pstatus{$package}{done} = 1;
+
+	return if ($ptype eq "L" || $ptype eq "V");
+
+	# Recurse through dependencies
+	if ($pinfo) {
+		if ($ptype eq "S") {
+			pre_process_bdeps($level, $package, $pinfo);
+		} else {
+			pre_process_deps($level, $package, $prevdep_OR_name, $pinfo);
+		}
+	}
+
+	# Provides and reverse dependencies for the requested package
+	if ($level == 1 && ($with_provides || $show_rdeps)) {
+		my @provides = get_provides($pinfo);
+		if (! $with_provides || ! @provides) {
+			if ($show_rdeps) {
+				debug(4, "Find rdeps for the package");
+				find_rdeps(-1, $package);
+			}
+		} elsif (@provides) {
+			# Virtual packages
+			for my $provided (@provides) {
+				process_virtual($level, $provided, "", "L", ($package));
+			}
+			# Installed reverse dependencies for the package and its provides
+			if ($show_rdeps) {
+				debug(4, "Find rdeps for the package & its provides");
+				for my $p ($package, @provides) {
+					find_rdeps(-1, $p, $package, @provides);
+				}
+			}
+		}
+	}
+
+	if ($show_installed && is_installed($package) &&
+	    ! get_prior_OR_dep $package) {
+		mark_installed($level, $package);
+	} elsif ($level == 1) {
+		printf("\t\"$package\" [style=\"setlinewidth(2)\"]\n");
+	}
+
+	debug(3, "Level $level: processing $package" . ($ptype ? " ($ptype)" : "") . " - done");
+}
+
+### MAINLINE ###
+
+# Import lists to limit processing:
+# - "skip" packages are completely ignored: nothing is displayed
+# - "end" packages are displayed and marked as such, but we don't recurse
+#   to determine their dependencies
+if (! $show_all) {
+	my $file;
+	for $file ($skiplist_file, "$HOME/.debtree/skiplist", "/etc/debtree/skiplist") {
+		if (-r $file) {
+			info(3, "Using list of 'skip' packages from $file");
+			if (! $no_skip) {
+				import_list($file, "skip");
+			} else {
+				# Change skip packages to end packages
+				import_list($file, "end");
+			}
+			last;
+		}
+	}
+	for $file ($endlist_file, "$HOME/.debtree/endlist", "/etc/debtree/endlist") {
+		if (-r $file) {
+			info(3, "Using list of 'end' packages from $file");
+			import_list($file, "end");
+			last;
+		}
+	}
+}
+
+# ptype B/S indicates "start" binary/source package
+process_package(1, $requested_package, "", $ptype);
+
+# For packages we did not yet recurse through, check if they are virtual
+# packages as we want to show the providing package(s)
+info(2, "Processing leaf packages");
+for my $package (sort keys %pstatus) {
+	next unless exists $pstatus{$package}{leaf};
+	if (! exists $pstatus{$package}{done}) {
+		process_package(0, $package, "", "L");
+	}
+}
+
+info(2, "Final processing for graph");
+# Print record definitions for alternatives
+for my $OR_name (sort keys %OR_dep_list) {
+	print_alternatives("D", $OR_name, $OR_dep_list{$OR_name}{has_inst}, $OR_dep_list{$OR_name}{plist});
+}
+
+# Print record definitions for alternative provides
+for my $OR_name (sort keys %OR_virt_list) {
+	print_alternatives("P", $OR_name, $OR_virt_list{$OR_name}{has_inst}, $OR_virt_list{$OR_name}{plist});
+}
+
+# Set shape to diamond for packages whose dependencies we did not
+# recurse into
+for my $package (sort keys %pstatus) {
+	next unless exists $pstatus{$package}{ended};
+	mark_endpackage($package);
+}
+
+print_dot_footer();
+
+# does it make sense to show these numbers for rdeps?
+if (! $show_rdeps) {
+	printf("// total size of all shown packages: $total_size\n");
+	printf("// download size of all shown packages: $download_size\n");
+}
