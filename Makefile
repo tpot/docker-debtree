@@ -1,4 +1,4 @@
-PACKAGES = docker.io etcd runc notary docker-registry
+PACKAGES = docker.io etcd runc notary docker-registry docker-libkv
 DEBTREE = ./debtree
 
 default: $(addsuffix .pdf,$(PACKAGES))
