@@ -1,4 +1,4 @@
-PACKAGES = docker.io etcd
+PACKAGES = docker.io etcd runc
 DEBTREE = ./debtree
 
 default: $(addsuffix .pdf,$(PACKAGES))
