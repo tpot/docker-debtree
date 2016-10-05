@@ -19,3 +19,6 @@ gccgo
 dh-golang
 golang-etcd-dev
 golang-github-coreos-go-etcd-dev
+libjs-jquery-ui
+libjs-jquery
+libprotobuf-dev
