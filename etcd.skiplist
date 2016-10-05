@@ -17,3 +17,5 @@ debhelper
 libltdl-dev
 gccgo
 dh-golang
+golang-etcd-dev
+golang-github-coreos-go-etcd-dev
