@@ -3,7 +3,7 @@ DEBTREE = ./debtree
 
 default: $(addsuffix .pdf,$(PACKAGES))
 
-%.dot:
+%.dot: %.skiplist %.endlist
 	$(DEBTREE) -b $* --skiplist-file $*.skiplist --endlist-file $*.endlist > $@
 
 %.pdf: %.dot
